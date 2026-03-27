@@ -48,7 +48,9 @@ logger = logging.getLogger("mega_ai_bot")
 @dataclass(frozen=True)
 class ModelProfile:
     name: str
-    keep_alive: str
+    # Ollama keep_alive:
+    # -1: 모델 상주, 0: 즉시 해제, 또는 "5m" 같은 duration 문자열
+    keep_alive: Any
     temperature: float = 0.2
 
 
@@ -62,19 +64,19 @@ class Settings:
     embedding_model_name: str = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
 
     planner: ModelProfile = field(
-        default_factory=lambda: ModelProfile("llama3.1:8b", keep_alive="-1", temperature=0.1)
+        default_factory=lambda: ModelProfile("llama3.1:8b", keep_alive=-1, temperature=0.1)
     )
     specialist_code: ModelProfile = field(
-        default_factory=lambda: ModelProfile("qwen3-coder:30b", keep_alive="0", temperature=0.2)
+        default_factory=lambda: ModelProfile("qwen3-coder:30b", keep_alive=0, temperature=0.2)
     )
     specialist_reason: ModelProfile = field(
-        default_factory=lambda: ModelProfile("deepseek-r1:32b", keep_alive="0", temperature=0.2)
+        default_factory=lambda: ModelProfile("deepseek-r1:32b", keep_alive=0, temperature=0.2)
     )
     verifier: ModelProfile = field(
-        default_factory=lambda: ModelProfile("qwen3.5:35b", keep_alive="0", temperature=0.1)
+        default_factory=lambda: ModelProfile("qwen3.5:35b", keep_alive=0, temperature=0.1)
     )
     synthesizer: ModelProfile = field(
-        default_factory=lambda: ModelProfile("gemma2:9b", keep_alive="-1", temperature=0.3)
+        default_factory=lambda: ModelProfile("gemma2:9b", keep_alive=-1, temperature=0.3)
     )
 
     # MCP 서버: JSON 문자열 예시
@@ -126,7 +128,7 @@ class OllamaClient:
             "messages": messages,
             "stream": stream,
             "options": {"temperature": model.temperature},
-            "keep_alive": model.keep_alive,
+            "keep_alive": self._normalize_keep_alive(model.keep_alive),
         }
         if tools:
             payload["tools"] = tools
@@ -145,6 +147,16 @@ class OllamaClient:
         except Exception as e:
             logger.exception("Ollama 호출 중 알 수 없는 오류")
             raise RuntimeError(f"Ollama unknown error: {e}") from e
+
+    @staticmethod
+    def _normalize_keep_alive(keep_alive: Any) -> Any:
+        """
+        Ollama 버전에 따라 keep_alive가 duration 문자열(예: \"10m\") 또는 정수(-1/0)로 처리됩니다.
+        과거 설정값(\"-1\", \"0\")이 문자열로 들어오면 정수로 변환해 400 에러를 방지합니다.
+        """
+        if isinstance(keep_alive, str) and keep_alive.strip() in {"-1", "0"}:
+            return int(keep_alive.strip())
+        return keep_alive
 
 
 # ---------------------------------------------------------
@@ -535,11 +547,12 @@ class TelegramAIAssistantApp:
 
     @staticmethod
     def _parse_mcp_servers(raw: str) -> List[Dict[str, Any]]:
+        # dotenv는 멀티라인 JSON 파싱에 취약할 수 있어, 먼저 정규 JSON 문자열을 기대합니다.
         try:
             data = json.loads(raw)
             return data if isinstance(data, list) else []
         except Exception:
-            logger.warning("MCP_SERVERS_JSON 파싱 실패")
+            logger.warning("MCP_SERVERS_JSON 파싱 실패 (JSON 배열 문자열인지 확인 필요)")
             return []
 
     async def setup(self) -> None:

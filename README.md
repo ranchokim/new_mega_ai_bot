@@ -130,22 +130,12 @@ python bot.py
 ### MCP
 
 - `MCP_SERVERS_JSON`: MCP 서버 목록(JSON 배열)
+- `.env` 문법상 **한 줄 JSON 문자열**로 넣어야 하며, 줄바꿈 JSON을 넣으면 `python-dotenv` 경고가 발생할 수 있습니다.
 
-예시:
+예시(한 줄):
 
 ```json
-[
-  {
-    "name": "filesystem",
-    "command": "npx",
-    "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]
-  },
-  {
-    "name": "sqlite",
-    "command": "npx",
-    "args": ["-y", "@modelcontextprotocol/server-sqlite", "--db-path", "./data.db"]
-  }
-]
+[{"name":"filesystem","command":"npx","args":["-y","@modelcontextprotocol/server-filesystem","."]},{"name":"sqlite","command":"npx","args":["-y","@modelcontextprotocol/server-sqlite","--db-path","./data.db"]}]
 ```
 
 ---
@@ -186,4 +176,3 @@ python bot.py
 - [ ] `.env`의 Telegram 토큰이 유효한가?
 - [ ] (선택) `MCP_SERVERS_JSON` 명령이 로컬에서 실행 가능한가?
 - [ ] `python bot.py` 실행 시 초기화 로그가 정상 출력되는가?
-
