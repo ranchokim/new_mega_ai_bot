@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -22,9 +23,14 @@ from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunct
 try:
     from mcp.client.stdio import stdio_client  # type: ignore
     from mcp.client.session import ClientSession  # type: ignore
+    try:
+        from mcp import StdioServerParameters  # type: ignore
+    except Exception:  # pragma: no cover
+        StdioServerParameters = None
 except Exception:  # pragma: no cover
     stdio_client = None
     ClientSession = None
+    StdioServerParameters = None
 
 try:
     from interpreter import interpreter  # type: ignore
@@ -62,6 +68,8 @@ class Settings:
     chroma_path: str = "./chroma_db"
     chroma_collection: str = "conversation_memory"
     embedding_model_name: str = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
+    pipeline_timeout_sec: float = 300.0
+    enable_open_interpreter: bool = False
 
     planner: ModelProfile = field(
         default_factory=lambda: ModelProfile("llama3.1:8b", keep_alive=-1, temperature=0.1)
@@ -99,6 +107,8 @@ def load_settings() -> Settings:
         embedding_model_name=os.getenv(
             "EMBEDDING_MODEL_NAME", "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
         ),
+        pipeline_timeout_sec=float(os.getenv("PIPELINE_TIMEOUT_SEC", "300")),
+        enable_open_interpreter=os.getenv("ENABLE_OPEN_INTERPRETER", "false").lower() in {"1", "true", "yes", "y"},
         mcp_servers_json=os.getenv("MCP_SERVERS_JSON", "[]"),
     )
 
@@ -256,6 +266,28 @@ class OpenInterpreterTool(ToolBase):
         "required": ["instruction"],
     }
 
+    def __init__(self, ollama_base_url: str, planner_model: str) -> None:
+        self.ollama_base_url = ollama_base_url.rstrip("/")
+        self.planner_model = planner_model
+        self._configure_interpreter()
+
+    def _configure_interpreter(self) -> None:
+        if interpreter is None:
+            return
+        try:
+            # 사람이 수동 승인하지 않아도 tool 실행이 완료되도록 auto_run 설정
+            if hasattr(interpreter, "auto_run"):
+                interpreter.auto_run = True
+            # 네트워크 호출 없이 로컬 Ollama를 사용하도록 강제
+            if hasattr(interpreter, "llm"):
+                # 요청사항: Open Interpreter 로컬 설정 강제
+                interpreter.llm.model = "ollama/llama3.1:8b"
+                interpreter.llm.api_base = "http://127.0.0.1:11434"
+                if getattr(interpreter.llm, "api_key", None) in {None, ""}:
+                    interpreter.llm.api_key = "x"
+        except Exception:
+            logger.warning("Open Interpreter 로컬 설정 적용 실패", exc_info=True)
+
     async def run(self, arguments: Dict[str, Any]) -> str:
         if interpreter is None:
             raise ToolRuntimeError("Open Interpreter를 import할 수 없습니다.")
@@ -321,7 +353,7 @@ class MCPManager:
                 continue
 
             try:
-                stdio_cm = stdio_client(command=command, args=args, env=env)
+                stdio_cm = self._build_stdio_context(command=command, args=args, env=env)
                 read_stream, write_stream = await stdio_cm.__aenter__()
                 session = ClientSession(read_stream, write_stream)
                 await session.__aenter__()
@@ -350,6 +382,32 @@ class MCPManager:
                 logger.exception("MCP 서버 연결 실패: %s", name)
 
         return self.tools
+
+    @staticmethod
+    def _build_stdio_context(command: str, args: List[str], env: Optional[Dict[str, str]]):
+        """
+        MCP SDK 버전별 stdio_client 시그니처 호환:
+        - stdio_client(server_parameters=StdioServerParameters(...))  # 최신 문법
+        - stdio_client(server=StdioServerParameters(...))             # 일부 버전
+        - stdio_client(command=..., args=..., env=...)                # 구버전
+        """
+        sig = inspect.signature(stdio_client)
+        params = set(sig.parameters.keys())
+
+        if StdioServerParameters is not None and "server_parameters" in params:
+            server_parameters = StdioServerParameters(command=command, args=args, env=env)
+            return stdio_client(server_parameters=server_parameters)
+        if StdioServerParameters is not None and "server" in params:
+            server = StdioServerParameters(command=command, args=args, env=env)
+            return stdio_client(server=server)
+        if "command" in params:
+            return stdio_client(command=command, args=args, env=env)
+
+        # fallback (구버전 positional)
+        try:
+            return stdio_client(command, args, env)
+        except TypeError:
+            return stdio_client(command, args)
 
     async def close(self) -> None:
         for session in reversed(self._sessions):
@@ -394,6 +452,8 @@ class MultiAgentOrchestrator:
                 "content": (
                     "당신은 Planner 에이전트입니다.\n"
                     "- 사용자 요청을 분석하고, 필요시 tool_calls로 도구를 호출하세요.\n"
+                    "- 도구는 반드시 필요한 경우에만 최소 횟수로 호출하세요.\n"
+                    "- 단순 설명/요약/일반 질의는 도구 없이 답변 계획을 작성하세요.\n"
                     "- 도구 실행이 끝나면 최종적으로 한국어 계획서(단계별)를 작성하세요.\n"
                     "- 모드: {mode}\n"
                 ),
@@ -556,7 +616,11 @@ class TelegramAIAssistantApp:
             return []
 
     async def setup(self) -> None:
-        tools: List[ToolBase] = [OpenInterpreterTool()]
+        tools: List[ToolBase] = []
+        if self.settings.enable_open_interpreter:
+            tools.append(OpenInterpreterTool(self.settings.ollama_base_url, self.settings.planner.name))
+        else:
+            logger.info("ENABLE_OPEN_INTERPRETER=false -> Open Interpreter tool 비활성화")
         mcp_tools = await self.mcp_manager.connect_and_discover()
         tools.extend(mcp_tools)
 
@@ -616,7 +680,10 @@ class TelegramAIAssistantApp:
     async def _process_and_reply(self, message: Message, mode: str, query: str) -> None:
         assert self.orchestrator is not None
         try:
-            result = await self.orchestrator.run(user_id=message.from_user.id, mode=mode, user_query=query)
+            result = await asyncio.wait_for(
+                self.orchestrator.run(user_id=message.from_user.id, mode=mode, user_query=query),
+                timeout=self.settings.pipeline_timeout_sec,
+            )
             await message.answer(result.final_answer)
             await self.memory.add_turn(
                 user_id=message.from_user.id,
@@ -629,6 +696,12 @@ class TelegramAIAssistantApp:
                 "처리 중 오류가 발생했습니다.\n"
                 f"- 원인: {e}\n"
                 "잠시 후 다시 시도하거나 질문을 더 짧게 나눠서 보내주세요."
+            )
+        except asyncio.TimeoutError:
+            logger.error("파이프라인 시간 초과 (timeout=%s초)", self.settings.pipeline_timeout_sec)
+            await message.answer(
+                "요청 처리 시간이 너무 길어 중단되었습니다.\n"
+                "질문을 더 짧게 나누거나, MCP/Open Interpreter 설정을 확인해주세요."
             )
         except Exception as e:
             logger.exception("예상치 못한 오류")

@@ -120,6 +120,7 @@ python bot.py
 
 - `OLLAMA_BASE_URL`: 기본 `http://localhost:11434`
 - `OLLAMA_TIMEOUT_SEC`: 모델 응답 타임아웃(초)
+- `PIPELINE_TIMEOUT_SEC`: 파이프라인 최대 처리 시간(초), 초과 시 타임아웃 메시지 반환
 
 ### ChromaDB
 
@@ -131,6 +132,7 @@ python bot.py
 
 - `MCP_SERVERS_JSON`: MCP 서버 목록(JSON 배열)
 - `.env` 문법상 **한 줄 JSON 문자열**로 넣어야 하며, 줄바꿈 JSON을 넣으면 `python-dotenv` 경고가 발생할 수 있습니다.
+- `ENABLE_OPEN_INTERPRETER`: `true`일 때만 Open Interpreter 도구를 활성화(기본 `false`)
 
 예시(한 줄):
 
@@ -176,3 +178,4 @@ python bot.py
 - [ ] `.env`의 Telegram 토큰이 유효한가?
 - [ ] (선택) `MCP_SERVERS_JSON` 명령이 로컬에서 실행 가능한가?
 - [ ] `python bot.py` 실행 시 초기화 로그가 정상 출력되는가?
+- [ ] 응답 직후 \"요청을 처리 중입니다...\" 안내가 오고, 이후 최종 답변 또는 타임아웃 안내가 도착하는가?
