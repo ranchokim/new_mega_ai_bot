@@ -65,11 +65,10 @@ class ModelProfile:
 class Settings:
     telegram_bot_token: str
     ollama_base_url: str = "http://localhost:11434"
-    ollama_timeout_sec: float = 120.0
     chroma_path: str = "./chroma_db"
     chroma_collection: str = "conversation_memory"
     embedding_model_name: str = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
-    pipeline_timeout_sec: float = 300.0
+    pipeline_timeout_sec: float = 1800.0
     enable_open_interpreter: bool = False
 
     planner: ModelProfile = field(
@@ -102,13 +101,12 @@ def load_settings() -> Settings:
     return Settings(
         telegram_bot_token=token,
         ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/"),
-        ollama_timeout_sec=float(os.getenv("OLLAMA_TIMEOUT_SEC", "120")),
         chroma_path=os.getenv("CHROMA_PATH", "./chroma_db"),
         chroma_collection=os.getenv("CHROMA_COLLECTION", "conversation_memory"),
         embedding_model_name=os.getenv(
             "EMBEDDING_MODEL_NAME", "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
         ),
-        pipeline_timeout_sec=float(os.getenv("PIPELINE_TIMEOUT_SEC", "300")),
+        pipeline_timeout_sec=float(os.getenv("PIPELINE_TIMEOUT_SEC", "1800")),
         enable_open_interpreter=os.getenv("ENABLE_OPEN_INTERPRETER", "false").lower() in {"1", "true", "yes", "y"},
         mcp_servers_json=os.getenv("MCP_SERVERS_JSON", "[]"),
     )
@@ -118,10 +116,10 @@ def load_settings() -> Settings:
 # Ollama 비동기 클라이언트
 # ---------------------------------------------------------
 class OllamaClient:
-    def __init__(self, base_url: str, timeout_sec: float) -> None:
+    def __init__(self, base_url: str) -> None:
         self.base_url = base_url
-        self.timeout = httpx.Timeout(timeout_sec)
-        self.client = httpx.AsyncClient(timeout=self.timeout)
+        # 로컬 대형 모델 응답이 오래 걸릴 수 있으므로 타임아웃 무제한(None) 설정
+        self.client = httpx.AsyncClient(timeout=None)
 
     async def close(self) -> None:
         await self.client.aclose()
@@ -602,7 +600,7 @@ class TelegramAIAssistantApp:
         self.settings = settings
         self.bot = Bot(token=settings.telegram_bot_token)
         self.dp = Dispatcher()
-        self.ollama = OllamaClient(settings.ollama_base_url, settings.ollama_timeout_sec)
+        self.ollama = OllamaClient(settings.ollama_base_url)
         self.memory = MemoryStore(
             persist_path=settings.chroma_path,
             collection_name=settings.chroma_collection,

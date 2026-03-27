@@ -119,8 +119,7 @@ python bot.py
 ### Ollama
 
 - `OLLAMA_BASE_URL`: 기본 `http://localhost:11434`
-- `OLLAMA_TIMEOUT_SEC`: 모델 응답 타임아웃(초)
-- `PIPELINE_TIMEOUT_SEC`: 파이프라인 최대 처리 시간(초), 초과 시 타임아웃 메시지 반환
+- `PIPELINE_TIMEOUT_SEC`: 파이프라인 최대 처리 시간(초), 기본 `1800`(30분)
 
 ### ChromaDB
 
