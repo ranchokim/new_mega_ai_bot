@@ -5,6 +5,7 @@ import logging
 import os
 import traceback
 import uuid
+from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -332,8 +333,8 @@ class MCPManager:
     def __init__(self, server_configs: List[Dict[str, Any]]) -> None:
         self.server_configs = server_configs
         self.tools: List[MCPTool] = []
-        self._sessions: List[Any] = []
-        self._stdio_contexts: List[Any] = []
+        self._exit_stack: Optional[AsyncExitStack] = None
+        self._is_connected = False
 
     async def connect_and_discover(self) -> List[MCPTool]:
         if not self.server_configs:
@@ -343,43 +344,55 @@ class MCPManager:
             logger.warning("MCP SDK import 실패로 MCP 기능 비활성화")
             return []
 
-        for cfg in self.server_configs:
-            name = cfg.get("name", "unknown")
-            command = cfg.get("command")
-            args = cfg.get("args", [])
-            env = cfg.get("env", None)
-            if not command:
-                logger.warning("MCP 서버(%s) command 누락", name)
-                continue
+        # 이전 연결이 있다면 먼저 안전하게 정리
+        if self._is_connected:
+            await self.close()
 
-            try:
-                stdio_cm = self._build_stdio_context(command=command, args=args, env=env)
-                read_stream, write_stream = await stdio_cm.__aenter__()
-                session = ClientSession(read_stream, write_stream)
-                await session.__aenter__()
-                await session.initialize()
+        self.tools = []
+        self._exit_stack = AsyncExitStack()
 
-                tools_result = await session.list_tools()
-                for t in tools_result.tools:
-                    async def _call_tool(arguments: Dict[str, Any], s=session, tn=t.name):
-                        res = await s.call_tool(tn, arguments)
-                        return getattr(res, "content", str(res))
+        try:
+            for cfg in self.server_configs:
+                name = cfg.get("name", "unknown")
+                command = cfg.get("command")
+                args = cfg.get("args", [])
+                env = cfg.get("env", None)
+                if not command:
+                    logger.warning("MCP 서버(%s) command 누락", name)
+                    continue
 
-                    self.tools.append(
-                        MCPTool(
-                            server_name=name,
-                            tool_name=t.name,
-                            description=getattr(t, "description", ""),
-                            input_schema=getattr(t, "inputSchema", {"type": "object", "properties": {}}),
-                            call_fn=_call_tool,
+                # 서버 단위 격리: 한 서버 실패가 전체 시작을 막지 않도록 처리
+                try:
+                    stdio_cm = self._build_stdio_context(command=command, args=args, env=env)
+                    read_stream, write_stream = await self._exit_stack.enter_async_context(stdio_cm)
+                    session = await self._exit_stack.enter_async_context(ClientSession(read_stream, write_stream))
+                    await session.initialize()
+
+                    tools_result = await session.list_tools()
+                    for t in tools_result.tools:
+                        async def _call_tool(arguments: Dict[str, Any], s=session, tn=t.name):
+                            res = await s.call_tool(tn, arguments)
+                            return getattr(res, "content", str(res))
+
+                        self.tools.append(
+                            MCPTool(
+                                server_name=name,
+                                tool_name=t.name,
+                                description=getattr(t, "description", ""),
+                                input_schema=getattr(t, "inputSchema", {"type": "object", "properties": {}}),
+                                call_fn=_call_tool,
+                            )
                         )
-                    )
 
-                self._stdio_contexts.append(stdio_cm)
-                self._sessions.append(session)
-                logger.info("MCP 서버 연결 성공: %s (tools=%d)", name, len(tools_result.tools))
-            except Exception:
-                logger.exception("MCP 서버 연결 실패: %s", name)
+                    logger.info("MCP 서버 연결 성공: %s (tools=%d)", name, len(tools_result.tools))
+                except Exception:
+                    logger.exception("MCP 서버 연결 실패(건너뜀): %s", name)
+
+            self._is_connected = True
+        except Exception:
+            # 상위 레벨 예외도 앱을 죽이지 않고 로그 후 빈 도구로 fallback
+            logger.exception("MCP 초기화 중 치명적 오류 발생, MCP 기능 비활성화")
+            await self.close()
 
         return self.tools
 
@@ -410,16 +423,16 @@ class MCPManager:
             return stdio_client(command, args)
 
     async def close(self) -> None:
-        for session in reversed(self._sessions):
-            try:
-                await session.__aexit__(None, None, None)
-            except Exception:
-                logger.warning("MCP session 종료 실패", exc_info=True)
-        for stdio_cm in reversed(self._stdio_contexts):
-            try:
-                await stdio_cm.__aexit__(None, None, None)
-            except Exception:
-                logger.warning("MCP stdio 종료 실패", exc_info=True)
+        self.tools = []
+        self._is_connected = False
+        if self._exit_stack is None:
+            return
+        try:
+            await self._exit_stack.aclose()
+        except Exception:
+            logger.warning("MCP 종료 중 오류 발생(무시하고 종료)", exc_info=True)
+        finally:
+            self._exit_stack = None
 
 
 # ---------------------------------------------------------
