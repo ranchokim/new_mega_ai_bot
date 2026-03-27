@@ -1,46 +1,34 @@
+#!/usr/bin/env python3
+"""Telegram + Ollama + MCP + Open Interpreter + ChromaDB 비동기 멀티 에이전트 봇."""
+
+from __future__ import annotations
+
 import asyncio
+import importlib
 import inspect
 import json
 import logging
 import os
+import time
 import traceback
 import uuid
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import chromadb
 import httpx
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import Message
-from dotenv import load_dotenv
-
-import chromadb
 from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
-
-# MCP SDK(공식)와 Open Interpreter는 설치/환경에 따라 import 경로가 달라질 수 있어
-# 최대한 안전하게 import하고, 실패 시 기능을 비활성화(fallback)합니다.
-try:
-    from mcp.client.stdio import stdio_client  # type: ignore
-    from mcp.client.session import ClientSession  # type: ignore
-    try:
-        from mcp import StdioServerParameters  # type: ignore
-    except Exception:  # pragma: no cover
-        StdioServerParameters = None
-except Exception:  # pragma: no cover
-    stdio_client = None
-    ClientSession = None
-    StdioServerParameters = None
-
-try:
-    from interpreter import interpreter  # type: ignore
-except Exception:  # pragma: no cover
-    interpreter = None
+from dotenv import load_dotenv
 
 
 # ---------------------------------------------------------
-# 로깅 설정
+# 로깅
 # ---------------------------------------------------------
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -50,197 +38,172 @@ logger = logging.getLogger("mega_ai_bot")
 
 
 # ---------------------------------------------------------
-# 모델 프로필 및 설정
+# 모델 프로필
 # ---------------------------------------------------------
 @dataclass(frozen=True)
 class ModelProfile:
     name: str
-    # Ollama keep_alive:
-    # -1: 모델 상주, 0: 즉시 해제, 또는 "5m" 같은 duration 문자열
     keep_alive: Any
-    temperature: float = 0.2
+    role: str
+
+
+MODEL_PROFILES: Dict[str, ModelProfile] = {
+    "fast": ModelProfile(name="llama3.1:8b", keep_alive=-1, role="빠른 일반 대화"),
+    "general": ModelProfile(name="llama3.1:8b", keep_alive=-1, role="일반 지식/작성"),
+    "verifier": ModelProfile(name="qwen3.5:35b", keep_alive=0, role="검토/비평"),
+    "code": ModelProfile(name="qwen3-coder:30b", keep_alive=0, role="코드/디버깅"),
+    "reason": ModelProfile(name="deepseek-r1:32b", keep_alive=0, role="고난도 추론"),
+    "synth": ModelProfile(name="gemma2:9b", keep_alive=-1, role="최종 합성"),
+    "fallback": ModelProfile(name="phi3:latest", keep_alive=0, role="경량 대체"),
+}
 
 
 @dataclass
 class Settings:
     telegram_bot_token: str
-    ollama_base_url: str = "http://localhost:11434"
+    ollama_base_url: str = "http://127.0.0.1:11434"
     chroma_path: str = "./chroma_db"
     chroma_collection: str = "conversation_memory"
     embedding_model_name: str = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
     pipeline_timeout_sec: float = 1800.0
+
     enable_open_interpreter: bool = False
+    open_interpreter_model: str = "ollama/llama3.1:8b"
+    open_interpreter_api_base: str = "http://127.0.0.1:11434"
 
-    planner: ModelProfile = field(
-        default_factory=lambda: ModelProfile("llama3.1:8b", keep_alive=-1, temperature=0.1)
-    )
-    specialist_code: ModelProfile = field(
-        default_factory=lambda: ModelProfile("qwen3-coder:30b", keep_alive=0, temperature=0.2)
-    )
-    specialist_reason: ModelProfile = field(
-        default_factory=lambda: ModelProfile("deepseek-r1:32b", keep_alive=0, temperature=0.2)
-    )
-    verifier: ModelProfile = field(
-        default_factory=lambda: ModelProfile("qwen3.5:35b", keep_alive=0, temperature=0.1)
-    )
-    synthesizer: ModelProfile = field(
-        default_factory=lambda: ModelProfile("gemma2:9b", keep_alive=-1, temperature=0.3)
-    )
-
-    # MCP 서버: JSON 문자열 예시
-    # [{"name":"filesystem","command":"npx","args":["-y","@modelcontextprotocol/server-filesystem","."]}]
     mcp_servers_json: str = "[]"
+    workspace_dir: str = "./workspace_steps"
+    max_stage_chars: int = 1400
 
 
 def load_settings() -> Settings:
     load_dotenv()
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
-        raise ValueError("TELEGRAM_BOT_TOKEN 이 설정되지 않았습니다.")
+        raise RuntimeError("TELEGRAM_BOT_TOKEN 환경변수가 필요합니다.")
 
     return Settings(
         telegram_bot_token=token,
-        ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/"),
+        ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/"),
         chroma_path=os.getenv("CHROMA_PATH", "./chroma_db"),
         chroma_collection=os.getenv("CHROMA_COLLECTION", "conversation_memory"),
         embedding_model_name=os.getenv(
             "EMBEDDING_MODEL_NAME", "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
         ),
         pipeline_timeout_sec=float(os.getenv("PIPELINE_TIMEOUT_SEC", "1800")),
-        enable_open_interpreter=os.getenv("ENABLE_OPEN_INTERPRETER", "false").lower() in {"1", "true", "yes", "y"},
+        enable_open_interpreter=os.getenv("ENABLE_OPEN_INTERPRETER", "false").lower() in {"1", "true", "yes", "on"},
+        open_interpreter_model=os.getenv("OI_MODEL", "ollama/llama3.1:8b"),
+        open_interpreter_api_base=os.getenv("OI_API_BASE", "http://127.0.0.1:11434"),
         mcp_servers_json=os.getenv("MCP_SERVERS_JSON", "[]"),
+        workspace_dir=os.getenv("CHAIN_WORKSPACE_DIR", "./workspace_steps"),
+        max_stage_chars=int(os.getenv("MULTI_MAX_CHARS_PER_STAGE", "1400")),
     )
 
 
 # ---------------------------------------------------------
-# Ollama 비동기 클라이언트
+# 유틸
+# ---------------------------------------------------------
+def summarize_text(text: str, max_chars: int) -> str:
+    t = text.strip()
+    return t if len(t) <= max_chars else f"{t[:max_chars]}\n...(중간 출력 생략)"
+
+
+def safe_name(name: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in name)
+
+
+# ---------------------------------------------------------
+# Ollama Client (timeout=None)
 # ---------------------------------------------------------
 class OllamaClient:
-    def __init__(self, base_url: str) -> None:
+    def __init__(self, base_url: str):
         self.base_url = base_url
-        # 로컬 대형 모델 응답이 오래 걸릴 수 있으므로 타임아웃 무제한(None) 설정
         self.client = httpx.AsyncClient(timeout=None)
 
     async def close(self) -> None:
         await self.client.aclose()
+
+    @staticmethod
+    def normalize_keep_alive(value: Any) -> Any:
+        if isinstance(value, str) and value.strip() in {"-1", "0"}:
+            return int(value.strip())
+        return value
 
     async def chat(
         self,
         model: ModelProfile,
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
-        stream: bool = False,
+        temperature: float = 0.3,
     ) -> Dict[str, Any]:
-        url = f"{self.base_url}/api/chat"
         payload: Dict[str, Any] = {
             "model": model.name,
+            "stream": False,
             "messages": messages,
-            "stream": stream,
-            "options": {"temperature": model.temperature},
-            "keep_alive": self._normalize_keep_alive(model.keep_alive),
+            "options": {"temperature": temperature},
+            "keep_alive": self.normalize_keep_alive(model.keep_alive),
         }
         if tools:
             payload["tools"] = tools
 
         try:
-            resp = await self.client.post(url, json=payload)
+            resp = await self.client.post(f"{self.base_url}/api/chat", json=payload)
             resp.raise_for_status()
-            data = resp.json()
-            return data
-        except httpx.TimeoutException as e:
-            logger.exception("Ollama 타임아웃 발생")
-            raise RuntimeError(f"Ollama timeout: {e}") from e
+            return resp.json()
         except httpx.HTTPStatusError as e:
             logger.exception("Ollama HTTP 오류")
             raise RuntimeError(f"Ollama bad response: {e.response.text}") from e
         except Exception as e:
-            logger.exception("Ollama 호출 중 알 수 없는 오류")
-            raise RuntimeError(f"Ollama unknown error: {e}") from e
-
-    @staticmethod
-    def _normalize_keep_alive(keep_alive: Any) -> Any:
-        """
-        Ollama 버전에 따라 keep_alive가 duration 문자열(예: \"10m\") 또는 정수(-1/0)로 처리됩니다.
-        과거 설정값(\"-1\", \"0\")이 문자열로 들어오면 정수로 변환해 400 에러를 방지합니다.
-        """
-        if isinstance(keep_alive, str) and keep_alive.strip() in {"-1", "0"}:
-            return int(keep_alive.strip())
-        return keep_alive
+            logger.exception("Ollama 호출 실패")
+            raise RuntimeError(f"Ollama error: {e}") from e
 
 
 # ---------------------------------------------------------
-# ChromaDB 기반 장기 기억(RAG)
+# ChromaDB Memory
 # ---------------------------------------------------------
 class MemoryStore:
-    def __init__(self, persist_path: str, collection_name: str, embedding_model: str) -> None:
-        emb_fn = SentenceTransformerEmbeddingFunction(model_name=embedding_model)
-        self.client = chromadb.PersistentClient(path=persist_path)
+    def __init__(self, settings: Settings):
+        emb_fn = SentenceTransformerEmbeddingFunction(model_name=settings.embedding_model_name)
+        self.client = chromadb.PersistentClient(path=settings.chroma_path)
         self.collection = self.client.get_or_create_collection(
-            name=collection_name,
+            name=settings.chroma_collection,
             embedding_function=emb_fn,
             metadata={"hnsw:space": "cosine"},
         )
 
-    async def add_turn(self, user_id: int, user_text: str, assistant_text: str) -> None:
-        timestamp = datetime.now(timezone.utc).isoformat()
-        doc = (
-            f"[time] {timestamp}\n"
-            f"[user_id] {user_id}\n"
-            f"[user] {user_text}\n"
-            f"[assistant] {assistant_text}"
-        )
-        metadata = {
-            "user_id": str(user_id),
-            "timestamp": timestamp,
-            "type": "conversation_turn",
-        }
-        uid = str(uuid.uuid4())
+    async def add_turn(self, chat_id: int, role: str, text: str) -> None:
+        doc = f"[{role}] {text.strip()}"
+        ts = datetime.now(timezone.utc).isoformat()
         await asyncio.to_thread(
             self.collection.add,
-            ids=[uid],
+            ids=[str(uuid.uuid4())],
             documents=[doc],
-            metadatas=[metadata],
+            metadatas=[{"chat_id": str(chat_id), "role": role, "ts": ts}],
         )
 
-    async def retrieve_similar(self, user_id: int, query: str, k: int = 5) -> List[str]:
+    async def retrieve(self, chat_id: int, query: str, k: int = 5) -> List[str]:
         try:
-            result = await asyncio.to_thread(
+            res = await asyncio.to_thread(
                 self.collection.query,
                 query_texts=[query],
                 n_results=k,
-                where={"user_id": str(user_id)},
+                where={"chat_id": str(chat_id)},
             )
-            docs = result.get("documents", [[]])[0]
-            return docs if docs else []
+            return res.get("documents", [[]])[0] or []
         except Exception:
-            # 사용자별 필터가 없는 기존 데이터/예외 시 전체 검색 fallback
-            logger.warning("사용자 필터 검색 실패 -> 전체 검색 fallback", exc_info=True)
-            try:
-                result = await asyncio.to_thread(
-                    self.collection.query,
-                    query_texts=[query],
-                    n_results=k,
-                )
-                docs = result.get("documents", [[]])[0]
-                return docs if docs else []
-            except Exception:
-                logger.exception("Chroma 검색 최종 실패")
-                return []
+            logger.warning("Chroma 검색 실패", exc_info=True)
+            return []
 
 
 # ---------------------------------------------------------
-# 도구(Tool) 인터페이스 및 구현
+# Tool 인터페이스
 # ---------------------------------------------------------
-class ToolRuntimeError(Exception):
-    pass
-
-
 class ToolBase:
     name: str
     description: str
     input_schema: Dict[str, Any]
 
-    def as_ollama_schema(self) -> Dict[str, Any]:
+    def schema(self) -> Dict[str, Any]:
         return {
             "type": "function",
             "function": {
@@ -256,57 +219,52 @@ class ToolBase:
 
 class OpenInterpreterTool(ToolBase):
     name = "open_interpreter"
-    description = "파이썬/셸 작업을 Open Interpreter로 수행합니다."
+    description = "Open Interpreter로 실제 시스템 작업을 수행합니다."
     input_schema = {
         "type": "object",
-        "properties": {
-            "instruction": {"type": "string", "description": "실행 지시문"},
-        },
+        "properties": {"instruction": {"type": "string"}},
         "required": ["instruction"],
     }
 
-    def __init__(self, ollama_base_url: str, planner_model: str) -> None:
-        self.ollama_base_url = ollama_base_url.rstrip("/")
-        self.planner_model = planner_model
-        self._configure_interpreter()
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self._interpreter: Any = None
+        self._initialize()
 
-    def _configure_interpreter(self) -> None:
-        if interpreter is None:
-            return
+    def _initialize(self) -> None:
         try:
-            # 사람이 수동 승인하지 않아도 tool 실행이 완료되도록 auto_run 설정
-            if hasattr(interpreter, "auto_run"):
-                interpreter.auto_run = True
-            # 네트워크 호출 없이 로컬 Ollama를 사용하도록 강제
-            if hasattr(interpreter, "llm"):
-                # 요청사항: Open Interpreter 로컬 설정 강제
-                interpreter.llm.model = "ollama/llama3.1:8b"
-                interpreter.llm.api_base = "http://127.0.0.1:11434"
-                if getattr(interpreter.llm, "api_key", None) in {None, ""}:
-                    interpreter.llm.api_key = "x"
+            module = importlib.import_module("interpreter")
+            self._interpreter = module.interpreter
+            self._interpreter.auto_run = True
+            self._interpreter.llm.model = "ollama/llama3.1:8b"
+            self._interpreter.llm.api_base = "http://127.0.0.1:11434"
+            if getattr(self._interpreter.llm, "api_key", None) in {None, ""}:
+                self._interpreter.llm.api_key = "x"
         except Exception:
-            logger.warning("Open Interpreter 로컬 설정 적용 실패", exc_info=True)
+            logger.warning("Open Interpreter 초기화 실패", exc_info=True)
+            self._interpreter = None
 
     async def run(self, arguments: Dict[str, Any]) -> str:
-        if interpreter is None:
-            raise ToolRuntimeError("Open Interpreter를 import할 수 없습니다.")
-        instruction = arguments.get("instruction", "")
+        if self._interpreter is None:
+            return "Open Interpreter 사용 불가(초기화 실패)."
+        instruction = str(arguments.get("instruction", "")).strip()
         if not instruction:
-            raise ToolRuntimeError("instruction 인자가 비어 있습니다.")
+            return "instruction 인자가 비어 있습니다."
 
-        def _run_sync() -> str:
-            try:
-                result = interpreter.chat(instruction)
-                return json.dumps(result, ensure_ascii=False)
-            except Exception as e:
-                raise ToolRuntimeError(f"Open Interpreter 실행 실패: {e}") from e
+        def _sync() -> str:
+            result = self._interpreter.chat(instruction)
+            if isinstance(result, str):
+                return result
+            return json.dumps(result, ensure_ascii=False)
 
-        return await asyncio.to_thread(_run_sync)
+        try:
+            return await asyncio.to_thread(_sync)
+        except Exception as e:
+            return f"Open Interpreter 실행 실패: {e}"
 
 
 class MCPTool(ToolBase):
-    def __init__(self, server_name: str, tool_name: str, description: str, input_schema: Dict[str, Any], call_fn):
-        self.server_name = server_name
+    def __init__(self, server_name: str, tool_name: str, description: str, input_schema: Dict[str, Any], call_fn: Callable):
         self.name = f"mcp::{server_name}::{tool_name}"
         self.description = description or f"MCP tool {tool_name}"
         self.input_schema = input_schema or {"type": "object", "properties": {}}
@@ -315,59 +273,54 @@ class MCPTool(ToolBase):
     async def run(self, arguments: Dict[str, Any]) -> str:
         try:
             result = await self._call_fn(arguments)
-            if isinstance(result, str):
-                return result
-            return json.dumps(result, ensure_ascii=False)
+            return result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
         except Exception as e:
-            raise ToolRuntimeError(f"MCP tool 실행 실패({self.name}): {e}") from e
+            return f"MCP tool 실행 실패: {e}"
 
 
 class MCPManager:
-    """
-    MCP 서버와 연결하고 사용 가능한 도구를 동적으로 적재합니다.
-    공식 SDK의 버전 차이를 고려하여 실패 시 graceful fallback 합니다.
-    """
-
-    def __init__(self, server_configs: List[Dict[str, Any]]) -> None:
+    def __init__(self, server_configs: List[Dict[str, Any]]):
         self.server_configs = server_configs
         self.tools: List[MCPTool] = []
-        self._exit_stack: Optional[AsyncExitStack] = None
-        self._is_connected = False
+        self.exit_stack: Optional[AsyncExitStack] = None
 
     async def connect_and_discover(self) -> List[MCPTool]:
+        self.tools = []
         if not self.server_configs:
             logger.info("MCP 서버 설정이 없어 건너뜁니다.")
             return []
-        if stdio_client is None or ClientSession is None:
+
+        try:
+            stdio_mod = importlib.import_module("mcp.client.stdio")
+            session_mod = importlib.import_module("mcp.client.session")
+            mcp_mod = importlib.import_module("mcp")
+            stdio_client = getattr(stdio_mod, "stdio_client")
+            ClientSession = getattr(session_mod, "ClientSession")
+            StdioServerParameters = getattr(mcp_mod, "StdioServerParameters", None)
+        except Exception:
             logger.warning("MCP SDK import 실패로 MCP 기능 비활성화")
             return []
 
-        # 이전 연결이 있다면 먼저 안전하게 정리
-        if self._is_connected:
-            await self.close()
-
-        self.tools = []
-        self._exit_stack = AsyncExitStack()
+        self.exit_stack = AsyncExitStack()
 
         try:
             for cfg in self.server_configs:
                 name = cfg.get("name", "unknown")
                 command = cfg.get("command")
                 args = cfg.get("args", [])
-                env = cfg.get("env", None)
+                env = cfg.get("env")
                 if not command:
                     logger.warning("MCP 서버(%s) command 누락", name)
                     continue
 
-                # 서버 단위 격리: 한 서버 실패가 전체 시작을 막지 않도록 처리
                 try:
-                    stdio_cm = self._build_stdio_context(command=command, args=args, env=env)
-                    read_stream, write_stream = await self._exit_stack.enter_async_context(stdio_cm)
-                    session = await self._exit_stack.enter_async_context(ClientSession(read_stream, write_stream))
+                    stdio_cm = self._build_stdio_context(stdio_client, StdioServerParameters, command, args, env)
+                    read_stream, write_stream = await self.exit_stack.enter_async_context(stdio_cm)
+                    session = await self.exit_stack.enter_async_context(ClientSession(read_stream, write_stream))
                     await session.initialize()
+                    tool_list = await session.list_tools()
 
-                    tools_result = await session.list_tools()
-                    for t in tools_result.tools:
+                    for t in tool_list.tools:
                         async def _call_tool(arguments: Dict[str, Any], s=session, tn=t.name):
                             res = await s.call_tool(tn, arguments)
                             return getattr(res, "content", str(res))
@@ -381,266 +334,184 @@ class MCPManager:
                                 call_fn=_call_tool,
                             )
                         )
-
-                    logger.info("MCP 서버 연결 성공: %s (tools=%d)", name, len(tools_result.tools))
+                    logger.info("MCP 서버 연결 성공: %s (tools=%d)", name, len(tool_list.tools))
                 except Exception:
                     logger.exception("MCP 서버 연결 실패(건너뜀): %s", name)
-
-            self._is_connected = True
         except Exception:
-            # 상위 레벨 예외도 앱을 죽이지 않고 로그 후 빈 도구로 fallback
-            logger.exception("MCP 초기화 중 치명적 오류 발생, MCP 기능 비활성화")
+            logger.exception("MCP 초기화 실패, 전체 MCP 비활성화")
             await self.close()
 
         return self.tools
 
     @staticmethod
-    def _build_stdio_context(command: str, args: List[str], env: Optional[Dict[str, str]]):
-        """
-        MCP SDK 버전별 stdio_client 시그니처 호환:
-        - stdio_client(server_parameters=StdioServerParameters(...))  # 최신 문법
-        - stdio_client(server=StdioServerParameters(...))             # 일부 버전
-        - stdio_client(command=..., args=..., env=...)                # 구버전
-        """
+    def _build_stdio_context(stdio_client: Callable, StdioServerParameters: Any, command: str, args: List[str], env: Optional[Dict[str, str]]):
         sig = inspect.signature(stdio_client)
         params = set(sig.parameters.keys())
 
         if StdioServerParameters is not None and "server_parameters" in params:
-            server_parameters = StdioServerParameters(command=command, args=args, env=env)
-            return stdio_client(server_parameters=server_parameters)
+            return stdio_client(server_parameters=StdioServerParameters(command=command, args=args, env=env))
         if StdioServerParameters is not None and "server" in params:
-            server = StdioServerParameters(command=command, args=args, env=env)
-            return stdio_client(server=server)
+            return stdio_client(server=StdioServerParameters(command=command, args=args, env=env))
         if "command" in params:
             return stdio_client(command=command, args=args, env=env)
-
-        # fallback (구버전 positional)
-        try:
-            return stdio_client(command, args, env)
-        except TypeError:
-            return stdio_client(command, args)
+        return stdio_client(command, args, env)
 
     async def close(self) -> None:
-        self.tools = []
-        self._is_connected = False
-        if self._exit_stack is None:
+        if self.exit_stack is None:
             return
         try:
-            await self._exit_stack.aclose()
+            await self.exit_stack.aclose()
         except Exception:
-            logger.warning("MCP 종료 중 오류 발생(무시하고 종료)", exc_info=True)
+            logger.warning("MCP 종료 오류(무시)", exc_info=True)
         finally:
-            self._exit_stack = None
+            self.exit_stack = None
 
 
 # ---------------------------------------------------------
-# 멀티 에이전트 오케스트레이터
+# Multi-agent orchestrator
 # ---------------------------------------------------------
-@dataclass
-class PipelineResult:
-    plan_text: str
-    specialist_draft: str
-    verifier_feedback: str
-    final_answer: str
-
-
 class MultiAgentOrchestrator:
-    def __init__(self, settings: Settings, ollama: OllamaClient, memory: MemoryStore, tools: List[ToolBase]) -> None:
+    def __init__(self, settings: Settings, ollama: OllamaClient, memory: MemoryStore, tools: List[ToolBase]):
         self.settings = settings
         self.ollama = ollama
         self.memory = memory
-        self.tools = {t.name: t for t in tools}
+        self.tools = {tool.name: tool for tool in tools}
 
-    async def _run_planner_with_tools(self, user_id: int, user_query: str, mode: str) -> Tuple[str, List[Dict[str, Any]]]:
-        memories = await self.memory.retrieve_similar(user_id=user_id, query=user_query, k=5)
-        memory_context = "\n\n".join(memories) if memories else "(유사 과거 대화 없음)"
+    async def _planner_with_tools(self, chat_id: int, task: str) -> Tuple[str, str, List[Dict[str, Any]]]:
+        history = await self.memory.retrieve(chat_id, task, k=5)
+        memory_context = "\n".join(history) if history else "(기억 없음)"
+        tool_trace: List[Dict[str, Any]] = []
 
-        tool_schemas = [t.as_ollama_schema() for t in self.tools.values()]
-
-        messages: List[Dict[str, Any]] = [
+        msgs: List[Dict[str, Any]] = [
             {
                 "role": "system",
                 "content": (
-                    "당신은 Planner 에이전트입니다.\n"
-                    "- 사용자 요청을 분석하고, 필요시 tool_calls로 도구를 호출하세요.\n"
-                    "- 도구는 반드시 필요한 경우에만 최소 횟수로 호출하세요.\n"
-                    "- 단순 설명/요약/일반 질의는 도구 없이 답변 계획을 작성하세요.\n"
-                    "- 도구 실행이 끝나면 최종적으로 한국어 계획서(단계별)를 작성하세요.\n"
-                    "- 모드: {mode}\n"
+                    "당신은 Planner입니다. 도구가 꼭 필요한 경우에만 tool_calls를 사용하세요.\n"
+                    "출력은 마지막에 한국어 단계 계획서로 정리하세요."
                 ),
             },
-            {
-                "role": "user",
-                "content": (
-                    f"[현재 사용자 질문]\n{user_query}\n\n"
-                    f"[유사 과거 대화 Top-5]\n{memory_context}\n"
-                ),
-            },
+            {"role": "user", "content": f"[기억]\n{memory_context}\n\n[요청]\n{task}"},
         ]
 
-        tool_trace: List[Dict[str, Any]] = []
+        schemas = [t.schema() for t in self.tools.values()]
 
-        for _ in range(6):  # 무한 루프 방지
-            planner_resp = await self.ollama.chat(
-                model=self.settings.planner,
-                messages=messages,
-                tools=tool_schemas if tool_schemas else None,
-            )
-            message = planner_resp.get("message", {})
-            tool_calls = message.get("tool_calls", []) or []
-
+        for _ in range(6):
+            resp = await self.ollama.chat(MODEL_PROFILES["fast"], msgs, tools=schemas, temperature=0.1)
+            msg = resp.get("message", {})
+            tool_calls = msg.get("tool_calls", []) or []
             if not tool_calls:
-                plan_text = message.get("content", "계획 생성 실패")
-                return plan_text, tool_trace
+                plan = msg.get("content", "계획 생성 실패")
+                return plan, memory_context, tool_trace
 
-            messages.append({"role": "assistant", "content": message.get("content", ""), "tool_calls": tool_calls})
-
-            for tc in tool_calls:
-                function_info = tc.get("function", {})
-                tool_name = function_info.get("name")
-                raw_args = function_info.get("arguments", {})
+            msgs.append({"role": "assistant", "content": msg.get("content", ""), "tool_calls": tool_calls})
+            for call in tool_calls:
+                fn = call.get("function", {})
+                name = fn.get("name")
+                raw_args = fn.get("arguments", {})
                 args = raw_args if isinstance(raw_args, dict) else json.loads(raw_args or "{}")
-
-                if tool_name not in self.tools:
-                    result = f"[오류] 존재하지 않는 도구: {tool_name}"
+                if name not in self.tools:
+                    result = f"도구 없음: {name}"
                 else:
-                    try:
-                        result = await self.tools[tool_name].run(args)
-                    except Exception as e:
-                        result = f"[도구 실행 실패] {e}"
+                    result = await self.tools[name].run(args)
+                tool_trace.append({"tool": name, "args": args, "result": result})
+                msgs.append({"role": "tool", "name": name, "content": result})
 
-                tool_trace.append({"tool": tool_name, "arguments": args, "result": result})
-                messages.append(
-                    {
-                        "role": "tool",
-                        "name": tool_name,
-                        "content": result,
-                    }
-                )
+        return "도구 루프 한도 초과", memory_context, tool_trace
 
-        return "계획 생성 중 도구 루프 한도 초과", tool_trace
+    async def run(self, chat_id: int, task: str, specialist_key: str, progress_cb: Callable[[str], Any]) -> str:
+        planner_model = MODEL_PROFILES["fast"]
+        verifier_model = MODEL_PROFILES["verifier"]
+        synthesizer_model = MODEL_PROFILES["synth"]
+        specialist = MODEL_PROFILES.get(specialist_key, MODEL_PROFILES["fast"])
 
-    async def _run_specialist(self, mode: str, user_query: str, plan_text: str, tool_trace: List[Dict[str, Any]]) -> str:
-        specialist_model = self.settings.specialist_code if mode == "code" else self.settings.specialist_reason
-        prompt = (
-            "당신은 Specialist 에이전트입니다.\n"
-            f"모드: {mode}\n"
-            "아래 계획/도구 결과를 바탕으로 초안을 작성하세요.\n\n"
-            f"[사용자 요청]\n{user_query}\n\n"
-            f"[계획]\n{plan_text}\n\n"
-            f"[도구 실행 로그]\n{json.dumps(tool_trace, ensure_ascii=False, indent=2)}"
-        )
-        resp = await self.ollama.chat(
-            model=specialist_model,
-            messages=[{"role": "user", "content": prompt}],
-            tools=None,
-        )
-        return resp.get("message", {}).get("content", "초안 생성 실패")
+        request_id = f"{int(time.time())}_{chat_id}_{uuid.uuid4().hex[:8]}"
+        Path(self.settings.workspace_dir).mkdir(parents=True, exist_ok=True)
 
-    async def _run_verifier(self, user_query: str, specialist_draft: str) -> str:
-        prompt = (
-            "당신은 Verifier 에이전트입니다.\n"
-            "아래 초안의 논리적 오류/코드 버그/누락 사항을 비판적으로 검토하세요.\n"
-            "출력 형식: 문제점, 근거, 수정 제안\n\n"
-            f"[사용자 요청]\n{user_query}\n\n"
-            f"[초안]\n{specialist_draft}"
-        )
-        resp = await self.ollama.chat(
-            model=self.settings.verifier,
-            messages=[{"role": "user", "content": prompt}],
-            tools=None,
-        )
-        return resp.get("message", {}).get("content", "검토 실패")
+        plan, memory_context, tool_trace = await self._planner_with_tools(chat_id, task)
+        await progress_cb(f"진행중 1/4: 계획 수립 완료 ({planner_model.name})")
+        self._save_stage(request_id, 1, "plan", planner_model.name, plan)
 
-    async def _run_synthesizer(self, user_query: str, plan_text: str, specialist_draft: str, verifier_feedback: str) -> str:
-        prompt = (
-            "당신은 Synthesizer 에이전트입니다.\n"
-            "최종 답변을 한국어 Markdown으로 사용자 친화적으로 작성하세요.\n"
-            "필요하면 코드 블록과 체크리스트를 활용하세요.\n\n"
-            f"[사용자 요청]\n{user_query}\n\n"
-            f"[계획]\n{plan_text}\n\n"
-            f"[초안]\n{specialist_draft}\n\n"
-            f"[검토]\n{verifier_feedback}"
+        spec_prompt = (
+            f"[사용자 요청]\n{task}\n\n"
+            f"[기억]\n{memory_context}\n\n"
+            f"[계획]\n{summarize_text(plan, self.settings.max_stage_chars)}\n\n"
+            f"[도구 로그]\n{summarize_text(json.dumps(tool_trace, ensure_ascii=False, indent=2), self.settings.max_stage_chars)}"
         )
-        resp = await self.ollama.chat(
-            model=self.settings.synthesizer,
-            messages=[{"role": "user", "content": prompt}],
-            tools=None,
-        )
-        return resp.get("message", {}).get("content", "최종 합성 실패")
+        spec = await self.ollama.chat(specialist, [{"role": "user", "content": spec_prompt}], temperature=0.25)
+        spec_text = spec.get("message", {}).get("content", "초안 실패")
+        await progress_cb(f"진행중 2/4: 전문가 초안 완료 ({specialist.name})")
+        self._save_stage(request_id, 2, "specialist", specialist.name, spec_text)
 
-    async def run(self, user_id: int, mode: str, user_query: str) -> PipelineResult:
-        plan_text, tool_trace = await self._run_planner_with_tools(user_id=user_id, user_query=user_query, mode=mode)
-        specialist_draft = await self._run_specialist(
-            mode=mode,
-            user_query=user_query,
-            plan_text=plan_text,
-            tool_trace=tool_trace,
+        review_prompt = (
+            f"[요청]\n{task}\n\n"
+            f"[초안]\n{summarize_text(spec_text, self.settings.max_stage_chars)}\n\n"
+            "문제점/근거/개선안을 한국어로 간결히 작성하세요."
         )
-        verifier_feedback = await self._run_verifier(user_query=user_query, specialist_draft=specialist_draft)
-        final_answer = await self._run_synthesizer(
-            user_query=user_query,
-            plan_text=plan_text,
-            specialist_draft=specialist_draft,
-            verifier_feedback=verifier_feedback,
+        review = await self.ollama.chat(verifier_model, [{"role": "user", "content": review_prompt}], temperature=0.1)
+        review_text = review.get("message", {}).get("content", "검토 실패")
+        await progress_cb(f"진행중 3/4: 검토 완료 ({verifier_model.name})")
+        self._save_stage(request_id, 3, "review", verifier_model.name, review_text)
+
+        synth_prompt = (
+            f"[요청]\n{task}\n\n"
+            f"[계획]\n{summarize_text(plan, self.settings.max_stage_chars)}\n\n"
+            f"[초안]\n{summarize_text(spec_text, self.settings.max_stage_chars)}\n\n"
+            f"[검토]\n{summarize_text(review_text, self.settings.max_stage_chars)}\n\n"
+            "최종 답변 형식: 1) 핵심요약 2) 실행단계 3) 주의사항"
         )
-        return PipelineResult(
-            plan_text=plan_text,
-            specialist_draft=specialist_draft,
-            verifier_feedback=verifier_feedback,
-            final_answer=final_answer,
-        )
+        final = await self.ollama.chat(synthesizer_model, [{"role": "user", "content": synth_prompt}], temperature=0.25)
+        final_text = final.get("message", {}).get("content", "최종 합성 실패")
+        await progress_cb(f"진행중 4/4: 최종 합성 완료 ({synthesizer_model.name})")
+        self._save_stage(request_id, 4, "synthesis", synthesizer_model.name, final_text)
+
+        return final_text
+
+    def _save_stage(self, req_id: str, idx: int, stage: str, model_name: str, content: str) -> None:
+        file_path = Path(self.settings.workspace_dir) / f"{req_id}_{idx:02d}_{stage}_{safe_name(model_name)}.md"
+        file_path.write_text(content.strip() + "\n", encoding="utf-8")
 
 
 # ---------------------------------------------------------
-# Telegram Bot 애플리케이션
+# Telegram app
 # ---------------------------------------------------------
 class TelegramAIAssistantApp:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.bot = Bot(token=settings.telegram_bot_token)
         self.dp = Dispatcher()
-        self.ollama = OllamaClient(settings.ollama_base_url)
-        self.memory = MemoryStore(
-            persist_path=settings.chroma_path,
-            collection_name=settings.chroma_collection,
-            embedding_model=settings.embedding_model_name,
-        )
 
-        self.mcp_manager = MCPManager(server_configs=self._parse_mcp_servers(settings.mcp_servers_json))
+        self.ollama = OllamaClient(settings.ollama_base_url)
+        self.memory = MemoryStore(settings)
+
+        self.mcp_manager = MCPManager(self._parse_mcp_servers(settings.mcp_servers_json))
         self.orchestrator: Optional[MultiAgentOrchestrator] = None
 
         self.dp.message.register(self.on_start, Command("start"))
-        self.dp.message.register(self.on_help, Command("help"))
+        self.dp.message.register(self.on_models, Command("models"))
+        self.dp.message.register(self.on_status, Command("status"))
         self.dp.message.register(self.on_code, Command("code"))
         self.dp.message.register(self.on_reason, Command("reason"))
+        self.dp.message.register(self.on_fast, Command("fast"))
+        self.dp.message.register(self.on_general, Command("general"))
         self.dp.message.register(self.on_default, F.text)
 
     @staticmethod
     def _parse_mcp_servers(raw: str) -> List[Dict[str, Any]]:
-        # dotenv는 멀티라인 JSON 파싱에 취약할 수 있어, 먼저 정규 JSON 문자열을 기대합니다.
         try:
-            data = json.loads(raw)
-            return data if isinstance(data, list) else []
+            v = json.loads(raw)
+            return v if isinstance(v, list) else []
         except Exception:
-            logger.warning("MCP_SERVERS_JSON 파싱 실패 (JSON 배열 문자열인지 확인 필요)")
+            logger.warning("MCP_SERVERS_JSON 파싱 실패")
             return []
 
     async def setup(self) -> None:
         tools: List[ToolBase] = []
         if self.settings.enable_open_interpreter:
-            tools.append(OpenInterpreterTool(self.settings.ollama_base_url, self.settings.planner.name))
-        else:
-            logger.info("ENABLE_OPEN_INTERPRETER=false -> Open Interpreter tool 비활성화")
+            tools.append(OpenInterpreterTool(self.settings))
         mcp_tools = await self.mcp_manager.connect_and_discover()
         tools.extend(mcp_tools)
 
-        self.orchestrator = MultiAgentOrchestrator(
-            settings=self.settings,
-            ollama=self.ollama,
-            memory=self.memory,
-            tools=tools,
-        )
+        self.orchestrator = MultiAgentOrchestrator(self.settings, self.ollama, self.memory, tools)
         logger.info("앱 초기화 완료 (tools=%d)", len(tools))
 
     async def shutdown(self) -> None:
@@ -649,79 +520,99 @@ class TelegramAIAssistantApp:
         await self.bot.session.close()
 
     async def on_start(self, message: Message) -> None:
+        text = (
+            "로컬 멀티 AI 비서가 시작되었습니다.\n"
+            "- /fast, /general, /code, /reason\n"
+            "- /models, /status\n"
+            "일반 텍스트는 fast 모드로 처리합니다."
+        )
+        await message.answer(text)
+
+    async def on_models(self, message: Message) -> None:
+        lines = ["사용 가능한 모델 프로필:"]
+        for k, v in MODEL_PROFILES.items():
+            lines.append(f"- {k}: {v.name} | {v.role}")
+        await message.answer("\n".join(lines))
+
+    async def on_status(self, message: Message) -> None:
+        enabled = "ON" if self.settings.enable_open_interpreter else "OFF"
         await message.answer(
-            "안녕하세요! 멀티 에이전트 로컬 AI 비서입니다.\n"
-            "- /code <질문>: 코딩 중심 분석\n"
-            "- /reason <질문>: 추론 중심 분석\n"
-            "일반 텍스트는 /reason 모드로 처리합니다."
+            f"상태: 정상\n- Ollama: {self.settings.ollama_base_url}\n- Open Interpreter: {enabled}\n- Pipeline timeout: {self.settings.pipeline_timeout_sec:.0f}s"
         )
 
-    async def on_help(self, message: Message) -> None:
-        await self.on_start(message)
-
     async def on_code(self, message: Message) -> None:
-        text = (message.text or "").replace("/code", "", 1).strip()
-        if not text:
-            await message.answer("사용법: /code FastAPI 인증 미들웨어 예시를 만들어줘")
-            return
-        await self._handle_user_query(message, mode="code", query=text)
+        task = (message.text or "").replace("/code", "", 1).strip()
+        await self._dispatch_request(message, task, specialist_key="code")
 
     async def on_reason(self, message: Message) -> None:
-        text = (message.text or "").replace("/reason", "", 1).strip()
-        if not text:
-            await message.answer("사용법: /reason 벡터DB와 RDB를 언제 같이 써야 해?")
-            return
-        await self._handle_user_query(message, mode="reason", query=text)
+        task = (message.text or "").replace("/reason", "", 1).strip()
+        await self._dispatch_request(message, task, specialist_key="reason")
+
+    async def on_fast(self, message: Message) -> None:
+        task = (message.text or "").replace("/fast", "", 1).strip()
+        await self._dispatch_request(message, task, specialist_key="fast")
+
+    async def on_general(self, message: Message) -> None:
+        task = (message.text or "").replace("/general", "", 1).strip()
+        await self._dispatch_request(message, task, specialist_key="general")
 
     async def on_default(self, message: Message) -> None:
-        text = (message.text or "").strip()
-        if not text:
-            return
-        await self._handle_user_query(message, mode="reason", query=text)
+        task = (message.text or "").strip()
+        await self._dispatch_request(message, task, specialist_key="fast")
 
-    async def _handle_user_query(self, message: Message, mode: str, query: str) -> None:
+    async def _dispatch_request(self, message: Message, task: str, specialist_key: str) -> None:
+        if not task:
+            await message.answer("질문 내용을 함께 보내주세요. 예: /code FastAPI 미들웨어 예시")
+            return
         if self.orchestrator is None:
-            await message.answer("초기화 중입니다. 잠시 후 다시 시도해주세요.")
+            await message.answer("초기화 중입니다. 잠시 후 재시도해주세요.")
             return
 
-        # 무거운 추론 중에도 이벤트 루프를 막지 않기 위해 task로 분리
-        asyncio.create_task(self._process_and_reply(message, mode, query))
-        await message.answer("요청을 처리 중입니다... (멀티 에이전트 파이프라인 실행)")
+        status = await message.answer(
+            "요청을 처리 중입니다... (멀티 에이전트 파이프라인 실행)\n"
+            "진행 상태를 순차 업데이트합니다."
+        )
+        asyncio.create_task(self._process_task(message, status.message_id, task, specialist_key))
 
-    async def _process_and_reply(self, message: Message, mode: str, query: str) -> None:
+    async def _process_task(self, message: Message, status_msg_id: int, task: str, specialist_key: str) -> None:
         assert self.orchestrator is not None
+        chat_id = message.chat.id
+        msg_id = message.message_id
+        start = time.time()
+
+        async def progress(text: str) -> None:
+            try:
+                await self.bot.edit_message_text(text=text, chat_id=chat_id, message_id=status_msg_id)
+            except Exception:
+                logger.warning("진행 상태 메시지 업데이트 실패", exc_info=True)
+
         try:
-            result = await asyncio.wait_for(
-                self.orchestrator.run(user_id=message.from_user.id, mode=mode, user_query=query),
+            await self.memory.add_turn(chat_id, "user", task)
+            final = await asyncio.wait_for(
+                self.orchestrator.run(chat_id=chat_id, task=task, specialist_key=specialist_key, progress_cb=progress),
                 timeout=self.settings.pipeline_timeout_sec,
             )
-            await message.answer(result.final_answer)
-            await self.memory.add_turn(
-                user_id=message.from_user.id,
-                user_text=query,
-                assistant_text=result.final_answer,
-            )
-        except RuntimeError as e:
-            logger.error("런타임 오류: %s", e)
-            await message.answer(
-                "처리 중 오류가 발생했습니다.\n"
-                f"- 원인: {e}\n"
-                "잠시 후 다시 시도하거나 질문을 더 짧게 나눠서 보내주세요."
-            )
+            await progress(f"완료: {time.time() - start:.1f}초\n엔진: Ollama 멀티 모델 순차 협업")
+            await message.answer(final, reply_to_message_id=msg_id)
+            await self.memory.add_turn(chat_id, "assistant", final)
         except asyncio.TimeoutError:
-            logger.error("파이프라인 시간 초과 (timeout=%s초)", self.settings.pipeline_timeout_sec)
-            await message.answer(
-                "요청 처리 시간이 너무 길어 중단되었습니다.\n"
-                "질문을 더 짧게 나누거나, MCP/Open Interpreter 설정을 확인해주세요."
-            )
+            await progress("실패: 파이프라인 시간 초과")
+            await message.answer("처리 시간이 너무 길어 중단되었습니다. 질문을 더 작게 나눠 주세요.", reply_to_message_id=msg_id)
         except Exception as e:
-            logger.exception("예상치 못한 오류")
-            await message.answer(
-                "예상치 못한 내부 오류가 발생했습니다.\n"
-                f"- 오류: {e}\n"
-                "로그를 확인해주세요."
-            )
-            logger.debug(traceback.format_exc())
+            logger.exception("요청 처리 실패")
+            await progress("실패: 멀티 에이전트 파이프라인 오류")
+            fallback = MODEL_PROFILES["fallback"]
+            try:
+                resp = await self.ollama.chat(
+                    fallback,
+                    [{"role": "user", "content": task}],
+                    temperature=0.25,
+                )
+                text = resp.get("message", {}).get("content", "(fallback 응답 없음)")
+                await message.answer(f"(fallback:{fallback.name})\n\n{text}", reply_to_message_id=msg_id)
+            except Exception as e2:
+                await message.answer(f"요청 처리 실패: {e}\nfallback 실패: {e2}", reply_to_message_id=msg_id)
+                logger.debug(traceback.format_exc())
 
     async def run(self) -> None:
         await self.setup()
@@ -732,8 +623,7 @@ class TelegramAIAssistantApp:
 
 
 async def main() -> None:
-    settings = load_settings()
-    app = TelegramAIAssistantApp(settings)
+    app = TelegramAIAssistantApp(load_settings())
     await app.run()
 
 
